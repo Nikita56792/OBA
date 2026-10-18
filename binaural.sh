@@ -20,8 +20,11 @@
 #   mpv   [опции]           прописать фильтр в ~/.config/mpv (вкл/выкл по Ctrl+b)
 #   tracks файл             показать аудиодорожки файла и их номера
 #   render [опции] файл     добавить в MKV бинауральную дорожку (для Infuse и любых плееров)
+#   atmos  [опции] файл     настоящий объектный рендер Dolby Atmos из TrueHD: объекты с их
+#                           координатами раскладываются по виртуальной системе 7.1.4
+#                           и добавляются в MKV бинауральной дорожкой
 #
-# Опции filter / mpv / render:
+# Опции filter / mpv / render / atmos:
 #   -p, --preset ИМЯ        пресет (по умолчанию atmos), список: ./binaural.sh list
 #   -g, --gain ДБ           усиление после свёртки (по умолчанию 22)
 #   -l, --lfe ДБ            уровень сабвуферного канала LFE относительно остальных (по умолчанию 0)
@@ -36,6 +39,11 @@
 #   -c, --codec КОДЕК       flac (по умолчанию, без потерь) или aac (320 кбит/с, меньше размер)
 #   -o, --output ФАЙЛ       куда писать (по умолчанию «имя.binaural-пресет.mkv»)
 #   -f, --force             перезаписать существующий файл
+# Только для atmos (кроме того, работают -p -g -l -e -a -c -o -f):
+#   -H, --height СИЛА       выраженность признака высоты у потолочных колонок:
+#                           0 — без него, 1 — по умолчанию, 1.5 — сильнее
+# Временные файлы atmos (~1 ГБ на 6 минут фильма) пишутся рядом с результатом;
+# другой каталог можно задать переменной BINAURAL_TMP.
 
 set -eu
 
@@ -95,7 +103,8 @@ Filter 10: ON PK Fc 4339 Hz Gain 0.9 dB Q 3.49"
 # ---------------------------------------------------------------- helpers
 
 WORK=""
-trap 'rm -rf "${WORK:-}"' EXIT
+HRIR714=""
+trap 'rm -rf "${WORK:-}" "${HRIR714:-}"' EXIT
 
 die()  { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -168,7 +177,7 @@ core_graph() {
 # Общие опции -p -g -l -e. Результат в OPT_*; остаток аргументов — в REST (строка через \n).
 parse_common() {
     OPT_PRESET=$DEF_PRESET; OPT_GAIN=$DEF_GAIN; OPT_LFE=$DEF_LFE; OPT_EQ=none
-    OPT_AUDIO=""; OPT_SURROUND=side; OPT_CODEC=flac; OPT_OUT=""; OPT_FORCE=0; OPT_FILE=""
+    OPT_AUDIO=""; OPT_SURROUND=side; OPT_CODEC=flac; OPT_OUT=""; OPT_FORCE=0; OPT_FILE=""; OPT_HEIGHT=1
     while [ $# -gt 0 ]; do
         case "$1" in
             -p|--preset)   OPT_PRESET=${2:?}; shift 2 ;;
@@ -180,6 +189,7 @@ parse_common() {
             -c|--codec)    OPT_CODEC=${2:?};  shift 2 ;;
             -o|--output)   OPT_OUT=${2:?};    shift 2 ;;
             -f|--force)    OPT_FORCE=1;       shift ;;
+            -H|--height)   OPT_HEIGHT=${2:?}; shift 2 ;;
             -h|--help)     usage; exit 0 ;;
             -*)            die "неизвестная опция $1" ;;
             *)             [ -z "$OPT_FILE" ] || die "лишний аргумент $1"; OPT_FILE=$1; shift ;;
@@ -187,6 +197,7 @@ parse_common() {
     done
     is_number "$OPT_GAIN" || die "gain должен быть числом"
     is_number "$OPT_LFE"  || die "lfe должен быть числом"
+    is_number "$OPT_HEIGHT" || die "height должен быть числом"
 }
 
 usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
@@ -315,6 +326,19 @@ cmd_mpv() {
 
 # ---------------------------------------------------------------- tracks / render
 
+# Аргументы кодека для новой аудиодорожки с номером $1 (по счёту среди аудиодорожек результата).
+codec_args() {
+    case "$OPT_CODEC" in
+        flac) printf '%s' "-c:a:$1 flac -sample_fmt:a:$1 s32 -bits_per_raw_sample:a:$1 24" ;;
+        aac)  if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' aac_at '; then
+                  printf '%s' "-c:a:$1 aac_at -b:a:$1 320k"
+              else
+                  printf '%s' "-c:a:$1 aac -b:a:$1 320k"
+              fi ;;
+        *) die "--codec: flac или aac" ;;
+    esac
+}
+
 cmd_tracks() {
     [ -n "${1:-}" ] && [ -f "$1" ] || die "укажите файл"
     ffprobe -v error -select_streams a \
@@ -329,7 +353,7 @@ cmd_render() {
     need_ffmpeg
     need_presets
     parse_common "$@"
-    local in=$OPT_FILE out nb aidx layout lang g pan="" codec_args sub_args="" ow=-n
+    local in=$OPT_FILE out nb aidx layout lang g pan="" codec sub_args="" ow=-n
     [ -n "$in" ] && [ -f "$in" ] || die "укажите файл фильма"
 
     nb=$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$in" | wc -l | tr -d ' ')
@@ -363,15 +387,7 @@ cmd_render() {
     [ "$out" != "$in" ] || die "выходной файл совпадает со входным"
     [ ! -e "$out" ] || [ "$OPT_FORCE" = 1 ] || die "$out уже существует (добавьте -f)"
 
-    case "$OPT_CODEC" in
-        flac) codec_args="-c:a:$nb flac -sample_fmt:a:$nb s32 -bits_per_raw_sample:a:$nb 24" ;;
-        aac)  if ffmpeg -hide_banner -encoders 2>/dev/null | grep -q ' aac_at '; then
-                  codec_args="-c:a:$nb aac_at -b:a:$nb 320k"
-              else
-                  codec_args="-c:a:$nb aac -b:a:$nb 320k"
-              fi ;;
-        *) die "--codec: flac или aac" ;;
-    esac
+    codec=$(codec_args "$nb")
 
     [ "$OPT_FORCE" = 1 ] && ow=-y
     case "$in" in *.[mM][pP]4|*.[mM]4[vV]|*.[mM][oO][vV]) sub_args="-c:s srt" ;; esac   # mov_text в MKV не кладётся
@@ -382,13 +398,580 @@ cmd_render() {
     ffmpeg -nostdin -hide_banner -loglevel error -stats $ow \
         -i "$in" -filter_complex "$g" \
         -map '0:v?' -map 0:a -map '0:s?' -map '0:t?' -map '[bin]' \
-        -c copy $codec_args $sub_args \
+        -c copy $codec $sub_args \
         -metadata:s:a:$nb title="Binaural ($OPT_PRESET)" \
         -metadata:s:a:$nb language="${lang:-und}" \
         -disposition:a 0 -disposition:a:$nb default \
         -max_muxing_queue_size 4096 \
         "$out"
     echo "Готово. В плеере выберите аудиодорожку «Binaural ($OPT_PRESET)»."
+}
+
+# ---------------------------------------------------------------- atmos
+
+PYTHON=${PYTHON:-python3}
+TRUEHDD_API="https://api.github.com/repos/truehdd/truehdd/releases/latest"
+
+need_python() {
+    command -v "$PYTHON" >/dev/null 2>&1 || die "нужен Python 3 (python3)"
+    if ! "$PYTHON" -c 'import numpy' 2>/dev/null; then
+        step "Устанавливаю numpy для Python…"
+        "$PYTHON" -m pip install --user numpy || die "не удалось установить numpy: $PYTHON -m pip install numpy"
+    fi
+}
+
+# Декодер TrueHD с поддержкой объектов Atmos: github.com/truehdd/truehdd (Apache-2.0).
+need_truehdd() {
+    if [ -n "${TRUEHDD:-}" ]; then
+        return 0
+    elif command -v truehdd >/dev/null 2>&1; then
+        TRUEHDD=$(command -v truehdd)
+        return 0
+    fi
+    TRUEHDD="$BASE/bin/truehdd"
+    [ -x "$TRUEHDD" ] && return 0
+
+    [ "$(uname -s)" = Darwin ] || die "укажите путь к truehdd в переменной TRUEHDD"
+    step "Скачиваю декодер truehdd (github.com/truehdd/truehdd)…"
+    local json url sum expected
+    json=$(curl -fsSL "$TRUEHDD_API") || die "не удалось получить список выпусков truehdd"
+    url=$(printf '%s' "$json" | "$PYTHON" -c '
+import json, sys
+for a in json.load(sys.stdin)["assets"]:
+    if a["name"].endswith("-universal-macOS.zip"):
+        print(a["browser_download_url"])
+        break')
+    [ -n "$url" ] || die "в последнем выпуске truehdd нет сборки для macOS"
+    mkdir -p "$BASE/bin"
+    curl -fL --retry 3 -o "$BASE/bin/truehdd.zip" "$url"
+    expected=$(curl -fsSL "$url.sha256" | awk '{print $1}')
+    sum=$(sha256_of "$BASE/bin/truehdd.zip")
+    [ -n "$expected" ] && [ "$sum" = "$expected" ] || die "контрольная сумма truehdd не совпала"
+    (cd "$BASE/bin" && unzip -o -q truehdd.zip && rm -f truehdd.zip)
+    chmod +x "$TRUEHDD"
+    xattr -d com.apple.quarantine "$TRUEHDD" 2>/dev/null || true
+    "$TRUEHDD" --version >/dev/null 2>&1 || codesign --force -s - "$TRUEHDD" >/dev/null 2>&1 || true
+    "$TRUEHDD" --version >/dev/null 2>&1 || die "truehdd не запускается: $TRUEHDD"
+}
+
+cmd_atmos() {
+    need_ffmpeg
+    need_presets
+    need_python
+    parse_common "$@"
+    local in=$OPT_FILE out nb aidx codec_name lang start dur tmpdir need_kb free_kb g hrir eqc gain rate codec ow=-n
+    [ -n "$in" ] && [ -f "$in" ] || die "укажите файл фильма"
+    hrir=$(preset_file "$OPT_PRESET")
+    eqc=$(eq_chain "$OPT_EQ")
+
+    nb=$(ffprobe -v error -select_streams a -show_entries stream=index -of csv=p=0 "$in" | wc -l | tr -d ' ')
+    if [ -n "$OPT_AUDIO" ]; then
+        aidx=$OPT_AUDIO
+        [ "$aidx" -ge 0 ] 2>/dev/null && [ "$aidx" -lt "$nb" ] || die "нет аудиодорожки -a $aidx (см. $0 tracks)"
+    else
+        aidx=$(ffprobe -v error -select_streams a -show_entries stream=codec_name -of csv=p=0 "$in" |
+            awk '$1 == "truehd" { print NR - 1; exit }')
+        [ -n "$aidx" ] || die "в файле нет дорожки TrueHD (Dolby Atmos из DD+ этот режим не декодирует)"
+    fi
+    codec_name=$(ffprobe -v error -select_streams "a:$aidx" -show_entries stream=codec_name -of csv=p=0 "$in")
+    [ "$codec_name" = truehd ] || die "дорожка -a $aidx — $codec_name, а не TrueHD"
+    lang=$(ffprobe -v error -select_streams "a:$aidx" -show_entries stream_tags=language -of csv=p=0 "$in")
+    start=$(ffprobe -v error -select_streams "a:$aidx" -show_entries stream=start_time -of csv=p=0 "$in")
+    is_number "$start" || start=0
+    dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$in")
+    is_number "$dur" || dur=0
+
+    out=${OPT_OUT:-"${in%.*}.atmos-$OPT_PRESET.mkv"}
+    [ "$out" != "$in" ] || die "выходной файл совпадает со входным"
+    [ ! -e "$out" ] || [ "$OPT_FORCE" = 1 ] || die "$out уже существует (добавьте -f)"
+    [ "$OPT_FORCE" = 1 ] && ow=-y
+    codec=$(codec_args "$nb")
+
+    # Объекты и кровать декодируются во временный файл: 16 каналов по 24 бита (~1 ГБ на 6 минут).
+    tmpdir=${BINAURAL_TMP:-$(dirname "$out")}
+    need_kb=$(awk -v d="$dur" 'BEGIN { printf "%d", d * 48000 * 16 * 3 / 1024 * 1.05 }')
+    free_kb=$(df -Pk "$tmpdir" | awk 'NR == 2 { print $4 }')
+    if [ "$free_kb" -lt $((need_kb + $(du -k "$in" | awk '{print $1}'))) ]; then
+        die "мало места в $tmpdir: нужно ~$((need_kb / 1048576)) ГБ временно плюс размер фильма для результата (BINAURAL_TMP — другой каталог)"
+    fi
+    need_truehdd
+
+    WORK=$(mktemp -d "$tmpdir/.binaural-atmos.XXXXXX")
+    write_renderer "$WORK/atmos_render.py"
+
+    step "1/3 Извлекаю объекты Atmos (truehdd)…"
+    set -o pipefail
+    # Матрёшка хранит время с точностью до 1 мс, и у соседних блоков TrueHD оно совпадает;
+    # в сыром потоке время не нужно, поэтому пакеты просто нумеруются.
+    ffmpeg -nostdin -hide_banner -loglevel error -i "$in" -map "0:a:$aidx" -c copy -bsf:a setts=ts=N -f truehd - |
+        "$TRUEHDD" decode - --output-path "$WORK/master" --loglevel warn \
+        || die "truehdd не смог декодировать дорожку; версию 7.1 без высот можно взять командой render"
+    set +o pipefail
+    [ -f "$WORK/master.atmos" ] || die "в дорожке нет объектов Atmos — для неё подойдёт обычный render"
+    # shellcheck disable=SC2046
+    set -- $("$PYTHON" "$WORK/atmos_render.py" info "$WORK/master.atmos")
+    [ $# -ge 4 ] || die "не удалось прочитать мастер Atmos"
+    rate=$1
+    echo "Кровать: ${*:5}; объектов: $4; частота: $rate Гц"
+
+    step "2/3 Готовлю отклики 7.1.4 из пресета $OPT_PRESET…"
+    # Рядом с пресетами: путь к ним уже проверен на символы, ломающие граф фильтров.
+    HRIR714="$HRIR_DIR/.hrir714-$$.wav"
+    "$PYTHON" "$WORK/atmos_render.py" make-hrir "$hrir" "$HRIR714" "$OPT_HEIGHT"
+
+    # headphone ослабляет на 3 дБ за канал: 12 каналов против 8 в render — компенсируем 12 дБ.
+    gain=$(awk -v g="$OPT_GAIN" 'BEGIN { g += 12; if (g > 40) g = 40; print g }')
+    g="[1:a]aformat=channel_layouts=7.1.4[a];amovie=${HRIR714}[h];[a][h]headphone=map=FL|FR|FC|LFE|BL|BR|SL|SR|TFL|TFR|TBL|TBR:hrir=multich:gain=$gain:lfe=$OPT_LFE${eqc:+,$eqc},alimiter=level=false:limit=0.97[bin]"
+
+    step "3/3 Рендер объектов и запись: $out"
+    set -o pipefail
+    # shellcheck disable=SC2086
+    if ! "$PYTHON" "$WORK/atmos_render.py" render "$WORK/master.atmos" |
+        ffmpeg -hide_banner -loglevel error -stats $ow \
+            -i "$in" -itsoffset "$start" -f f32le -ar "$rate" -ch_layout 7.1.4 -i pipe:0 \
+            -filter_complex "$g" \
+            -map '0:v?' -map 0:a -map '0:s?' -map '0:t?' -map '[bin]' \
+            -c copy $codec \
+            -metadata:s:a:$nb title="Atmos binaural ($OPT_PRESET)" \
+            -metadata:s:a:$nb language="${lang:-und}" \
+            -disposition:a 0 -disposition:a:$nb default \
+            -max_muxing_queue_size 9999 \
+            "$out"; then
+        rm -f "$out"
+        die "рендер прерван, неполный файл удалён"
+    fi
+    set +o pipefail
+    echo "Готово. В плеере выберите аудиодорожку «Atmos binaural ($OPT_PRESET)»."
+}
+
+# Объектный рендерер (Python + numpy), пишется во временный каталог при каждом запуске atmos.
+write_renderer() {
+    cat > "$1" <<'PYEOF'
+"""Object-based Dolby Atmos renderer for headphones (part of binaural.sh).
+
+Reads a Dolby Atmos master file set (DAMF) written by truehdd: the .atmos header,
+the .atmos.metadata object positions and the .atmos.audio CAF with the bed and
+object signals. Every bed channel and object is panned by its metadata into a
+virtual 7.1.4 speaker array (allocentric, room-centric cube panning, the
+coordinate system Atmos metadata is authored in). The 12 speaker feeds are
+written to stdout as 32-bit float PCM in FFmpeg's 7.1.4 channel order; FFmpeg's
+headphone filter then folds them into binaural stereo.
+
+make-hrir builds the impulse responses for that array from a binaural.sh preset:
+the floor layer is the preset itself, the four height speakers are the front and
+back speakers of the preset filtered with an elevation cue (the spectral change
+from 0 to 40 degrees elevation on the MIT KEMAR dummy head, smoothed to
+1/2 octave).
+"""
+
+import math
+import struct
+import sys
+
+import numpy as np
+
+# FFmpeg 7.1.4 order: FL FR FC LFE BL BR SL SR TFL TFR TBL TBR
+NSPK = 12
+LFE = 3
+# Speaker rows of the room cube: x (-1 left .. 1 right), y (1 front .. -1 back), z (0 ear level .. 1 ceiling)
+FLOOR_ROWS = [(-1.0, [(-1.0, 4), (1.0, 5)]),
+              (0.0, [(-1.0, 6), (1.0, 7)]),
+              (1.0, [(-1.0, 0), (0.0, 2), (1.0, 1)])]
+TOP_ROWS = [(-1.0, [(-1.0, 10), (1.0, 11)]),
+            (1.0, [(-1.0, 8), (1.0, 9)])]
+
+# Bed channel labels as truehdd names them, with their positions in the cube.
+W = 42.0 / 62.0
+BED_POS = {
+    'L': (-1, 1, 0), 'R': (1, 1, 0), 'C': (0, 1, 0), 'Lss': (-1, 0, 0), 'Rss': (1, 0, 0),
+    'Lrs': (-1, -1, 0), 'Rrs': (1, -1, 0), 'Lfh': (-1, 1, 1), 'Rfh': (1, 1, 1),
+    'Lts': (-1, 0, 1), 'Rts': (1, 0, 1), 'Lrh': (-1, -1, 1), 'Rrh': (1, -1, 1),
+    'Lw': (-1, W, 0), 'Rw': (1, W, 0),
+}
+
+# Elevation cue, dB at 1/6-octave centres: MIT KEMAR 40 deg over 0 deg elevation
+# (front: 45/40 over 30/0 azimuth/elevation, rear: 135/40 over 135/0), 1/2-octave smoothed.
+FREQS = [100, 112, 126, 141, 159, 178, 200, 224, 252, 283, 317, 356, 400, 449, 504, 566, 635, 713, 800, 898, 1008, 1131, 1270, 1425, 1600, 1796, 2016, 2263, 2540, 2851, 3200, 3592, 4032, 4525, 5080, 5702, 6400, 7184, 8063, 9051, 10159, 11404, 12800, 14368, 16127, 18102]
+CUES = {}  # filled from the table below by _load_cues
+
+
+def _load_cues(text):
+    for line in text.strip().splitlines():
+        name, values = line.split('=', 1)
+        CUES[name.strip()] = [float(v) for v in values.strip(' []').split(',')]
+
+
+_load_cues("""
+FRONT_L = [0.0, 0.0, 0.0, 0.0, -0.0, -0.0, 0.0, 0.0, 0.0, -0.0, -0.0, -0.1, -0.3, -0.3, -0.5, -1.0, -2.2, -2.7, -2.5, -1.7, -0.1, 2.1, 3.2, 3.0, 1.4, -0.8, -1.6, -0.0, 1.7, 2.4, 1.7, 0.3, 0.8, 1.7, 3.1, 6.4, 8.0, 8.0, 8.0, 8.0, 5.1, -3.8, -5.0, -4.2, -2.8, -2.8]
+FRONT_R = [-0.0, -0.0, 0.0, 0.0, 0.0, -0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.1, -0.2, -0.2, -0.8, -1.8, -4.1, -3.9, -1.7, 0.6, 2.2, 1.5, 0.2, -2.4, -2.7, -1.6, 0.3, 1.6, 1.5, 0.8, -0.0, 1.8, 3.4, 5.2, 8.0, 8.0, 8.0, 8.0, 8.0, 2.8, -9.2, -10.0, -8.1, -6.9, -6.9]
+REAR_L = [0.0, 0.0, -0.0, -0.0, -0.0, -0.0, -0.0, 0.0, 0.0, -0.0, -0.0, -0.1, -0.3, -0.3, -0.6, -1.2, -2.3, -2.8, -2.8, -3.2, -3.4, -2.7, -1.5, -0.3, 0.9, 1.5, 1.3, 0.5, -0.3, -0.4, 0.6, 2.6, 5.1, 6.4, 8.0, 8.0, 8.0, 8.0, 5.0, 8.0, 8.0, 8.0, -9.3, 0.3, 0.8, 0.8]
+REAR_R = [0.0, 0.0, 0.0, 0.0, -0.0, -0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.1, 0.2, 0.4, 0.3, -0.1, -1.3, 0.3, 0.6, 3.7, 3.9, 4.3, 2.9, 2.4, 1.8, 1.9, 2.1, 2.9, 3.9, 3.7, 2.8, 2.7, 5.1, 7.0, 8.0, 8.0, 8.0, 8.0, 8.0, 6.7, -4.3, 7.0, 6.6, 6.2, 6.2]
+""")
+
+
+# ------------------------------------------------------------------ panning
+
+def _pan1d(v, coords):
+    """Power-preserving pan between the two neighbours of v: [(index, gain), ...]."""
+    if v <= coords[0]:
+        return [(0, 1.0)]
+    if v >= coords[-1]:
+        return [(len(coords) - 1, 1.0)]
+    for i in range(len(coords) - 1):
+        a, b = coords[i], coords[i + 1]
+        if a <= v <= b:
+            t = (v - a) / (b - a)
+            return [(i, math.cos(t * math.pi / 2)), (i + 1, math.sin(t * math.pi / 2))]
+    return [(0, 1.0)]
+
+
+def _pan_point(x, y, z, gains, weight=1.0):
+    for li, gz in _pan1d(z, [0.0, 1.0]):
+        rows = FLOOR_ROWS if li == 0 else TOP_ROWS
+        for ri, gy in _pan1d(y, [r[0] for r in rows]):
+            spk = rows[ri][1]
+            for si, gx in _pan1d(x, [s[0] for s in spk]):
+                gains[spk[si][1]] += (weight * gz * gy * gx) ** 2
+
+
+_pan_cache = {}
+
+
+def pan(x, y, z, size=0.0, snap=False, elevation=True):
+    """Amplitude gains of the 12 speakers for a point (or an extended source) in the cube."""
+    key = (round(x, 5), round(y, 5), round(z, 5), round(size, 4), snap, elevation)
+    g = _pan_cache.get(key)
+    if g is not None:
+        return g
+    x = min(max(x, -1.0), 1.0)
+    y = min(max(y, -1.0), 1.0)
+    z = min(max(z, 0.0), 1.0) if elevation else 0.0
+    power = np.zeros(NSPK)
+    if size > 0:
+        offs = (-size, 0.0, size)
+        pts = [(x + a, y + b, z + c) for a in offs for b in offs for c in offs]
+        for px, py, pz in pts:
+            _pan_point(min(max(px, -1), 1), min(max(py, -1), 1), min(max(pz, 0), 1) if elevation else 0.0,
+                       power, 1.0 / math.sqrt(len(pts)))
+    else:
+        _pan_point(x, y, z, power)
+    if snap:
+        snapped = np.zeros(NSPK)
+        snapped[int(np.argmax(power))] = 1.0
+        power = snapped
+    g = np.sqrt(power / power.sum())
+    if len(_pan_cache) < 200000:
+        _pan_cache[key] = g
+    return g
+
+
+# ------------------------------------------------------------------ DAMF parsing
+
+def read_header(path):
+    """Element labels in audio channel order: beds first, then objects."""
+    elements, section, pending = [], None, None
+    with open(path, encoding='utf-8') as f:
+        for raw in f:
+            line = raw.strip()
+            if line in ('bedInstances:', 'objects:'):
+                section = line[:-1]
+                continue
+            if raw[:1] not in (' ', '-', '\t') and line.endswith(':'):
+                section = None
+            if section == 'bedInstances':
+                if line.startswith('- channel:') or line.startswith('channel:'):
+                    pending = line.split(':', 1)[1].strip()
+                elif line.startswith('ID:') and pending is not None:
+                    elements.append((int(line.split(':', 1)[1]), pending))
+                    pending = None
+            elif section == 'objects':
+                if line.startswith('- ID:') or line.startswith('ID:'):
+                    elements.append((int(line.split(':', 1)[1]), None))
+    if not elements:
+        raise SystemExit('no bed channels or objects in ' + path)
+    return elements
+
+
+def iter_events(path):
+    """Yield (samplePos, ID, {field: text}) in file order (time-ordered)."""
+    cur = None
+    with open(path, encoding='utf-8') as f:
+        for raw in f:
+            line = raw.strip()
+            if line.startswith('- ID:'):
+                if cur is not None:
+                    yield cur
+                cur = [None, int(line[5:]), {}]
+            elif cur is not None and ':' in line:
+                k, v = line.split(':', 1)
+                v = v.strip()
+                if k == 'samplePos':
+                    cur[0] = int(v)
+                else:
+                    cur[2][k] = v
+    if cur is not None:
+        yield cur
+
+
+class Element:
+    __slots__ = ('label', 'active', 'pos', 'gain', 'ramp', 'size', 'snap', 'elev', 'pts')
+
+    def __init__(self, label):
+        self.label = label
+        self.active, self.gain, self.ramp, self.size = True, 0.0, 0, 0.0
+        self.snap, self.elev = False, True
+        self.pos = BED_POS.get(label, (0.0, 1.0, 0.0)) if label else (0.0, 1.0, 0.0)
+        self.pts = [(0, np.zeros(NSPK))]  # piecewise-linear gain trajectory
+
+    def target(self):
+        if not self.active or self.gain == -math.inf:
+            return np.zeros(NSPK)
+        lin = 10.0 ** (self.gain / 20.0)
+        if self.label in ('LFE', 'LFE2'):
+            g = np.zeros(NSPK)
+            g[LFE] = lin
+            return g
+        return pan(*self.pos, size=self.size, snap=self.snap, elevation=self.elev) * lin
+
+    def value_at(self, t):
+        pts = self.pts
+        if t >= pts[-1][0]:
+            return pts[-1][1]
+        for i in range(len(pts) - 1, -1, -1):
+            if pts[i][0] <= t:
+                (t0, v0), (t1, v1) = pts[i], pts[i + 1]
+                return v0 + (v1 - v0) * ((t - t0) / (t1 - t0))
+        return pts[0][1]
+
+    def apply(self, t, fields):
+        for k, v in fields.items():
+            if k == 'active':
+                self.active = v == 'true'
+            elif k == 'pos':
+                x, y, z = (float(a) for a in v.strip('[]').split(','))
+                self.pos = (x, y, z)
+            elif k == 'gain':
+                self.gain = -math.inf if v == '-inf' else float(v)
+            elif k == 'rampLength':
+                self.ramp = int(v)
+            elif k == 'size':
+                self.size = float(v)
+            elif k == 'snap':
+                self.snap = v == 'true'
+            elif k == 'elevation':
+                self.elev = v == 'true'
+        now = self.value_at(t)
+        self.pts = [p for p in self.pts if p[0] < t] + [(t, now), (t + max(self.ramp, 1), self.target())]
+
+
+# ------------------------------------------------------------------ audio I/O
+
+def open_caf(path):
+    f = open(path, 'rb')
+    if f.read(4) != b'caff':
+        raise SystemExit(path + ' is not a CAF file')
+    f.read(4)
+    fmt = None
+    while True:
+        hdr = f.read(12)
+        if len(hdr) < 12:
+            raise SystemExit('no audio data in ' + path)
+        ctype, size = hdr[:4], struct.unpack('>q', hdr[4:])[0]
+        if ctype == b'desc':
+            rate, fid, flags, bpp, fpp, ch, bits = struct.unpack('>d4sIIIII', f.read(32))
+            if fid != b'lpcm':
+                raise SystemExit('unsupported CAF format ' + fid.decode(errors='replace'))
+            fmt = (rate, flags, ch, bits, bpp)
+            f.seek(size - 32, 1)
+        elif ctype == b'data':
+            f.read(4)  # edit count
+            return f, fmt
+        else:
+            f.seek(size, 1)
+
+
+def read_frames(f, fmt, n):
+    rate, flags, ch, bits, bpp = fmt
+    raw = f.read(n * bpp)
+    frames = len(raw) // bpp
+    if frames == 0:
+        return None
+    raw = raw[:frames * bpp]
+    little = bool(flags & 2)
+    if flags & 1:
+        a = np.frombuffer(raw, ('<' if little else '>') + ('f4' if bits == 32 else 'f8'))
+        return a.reshape(frames, ch).astype(np.float32)
+    if bits == 24:
+        b = np.frombuffer(raw, np.uint8).reshape(-1, 3).astype(np.int32)
+        v = (b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)) if little else ((b[:, 0] << 16) | (b[:, 1] << 8) | b[:, 2])
+        v = np.where(v >= 1 << 23, v - (1 << 24), v)
+        return (v.reshape(frames, ch) / 8388608.0).astype(np.float32)
+    dt = {16: 'i2', 32: 'i4'}[bits]
+    a = np.frombuffer(raw, ('<' if little else '>') + dt).reshape(frames, ch)
+    return (a / float(1 << (bits - 1))).astype(np.float32)
+
+
+def read_wav(path):
+    with open(path, 'rb') as f:
+        data = f.read()
+    if data[:4] != b'RIFF' or data[8:12] != b'WAVE':
+        raise SystemExit(path + ' is not a WAV file')
+    pos, fmt = 12, None
+    while pos + 8 <= len(data):
+        cid, size = data[pos:pos + 4], struct.unpack('<I', data[pos + 4:pos + 8])[0]
+        body = data[pos + 8:pos + 8 + size]
+        if cid == b'fmt ':
+            tag, ch, rate, _, _, bits = struct.unpack('<HHIIHH', body[:16])
+            if tag == 0xFFFE:
+                tag = struct.unpack('<H', body[24:26])[0]
+            fmt = (tag, ch, rate, bits)
+        elif cid == b'data':
+            tag, ch, rate, bits = fmt
+            if tag != 3 or bits != 32:
+                raise SystemExit(path + ': expected 32-bit float WAV')
+            return np.frombuffer(body, '<f4').reshape(-1, ch).copy(), rate
+        pos += 8 + size + (size & 1)
+    raise SystemExit('no data in ' + path)
+
+
+def write_wav(path, a, rate):
+    a = np.ascontiguousarray(a, '<f4')
+    frames, ch = a.shape
+    body = a.tobytes()
+    with open(path, 'wb') as f:
+        f.write(b'RIFF' + struct.pack('<I', 4 + 26 + 8 + len(body)) + b'WAVE')
+        f.write(b'fmt ' + struct.pack('<IHHIIHH', 18, 3, ch, rate, rate * ch * 4, ch * 4, 32) + b'\0\0')
+        f.write(b'data' + struct.pack('<I', len(body)) + body)
+
+
+# ------------------------------------------------------------------ commands
+
+def min_phase_fir(db_points, rate, taps=512):
+    n = taps * 8
+    f = np.fft.rfftfreq(n, 1.0 / rate)
+    d = np.interp(np.log(np.maximum(f, 1.0)), np.log(FREQS), db_points)
+    full = np.concatenate([d, d[-2:0:-1]]) * (math.log(10) / 20)
+    c = np.fft.ifft(full).real
+    fold = np.zeros(n)
+    fold[0], fold[n // 2] = c[0], c[n // 2]
+    fold[1:n // 2] = 2 * c[1:n // 2]
+    h = np.fft.ifft(np.exp(np.fft.fft(fold))).real[:taps]
+    return h * np.hanning(2 * taps)[taps:]
+
+
+def cmd_make_hrir(src, dst, strength):
+    """16-channel 7.1 preset -> 24-channel 7.1.4 set (pairs left ear, right ear)."""
+    h, rate = read_wav(src)
+    if h.shape[1] != 16:
+        raise SystemExit(src + ': expected 16 channels')
+    cue = {k: min_phase_fir([v * strength for v in CUES[k]], rate) for k in CUES}
+    out = np.zeros((h.shape[0] + 511, 24), np.float32)
+    out[:h.shape[0], :16] = h
+    # pair index in the 7.1 preset: FL 0, FR 1, BL 4, BR 5; right-side speakers mirror the cue
+    for dst_pair, src_pair, front, mirrored in ((8, 0, True, False), (9, 1, True, True),
+                                                (10, 4, False, False), (11, 5, False, True)):
+        name = 'FRONT' if front else 'REAR'
+        cue_l, cue_r = cue[name + '_L'], cue[name + '_R']
+        if mirrored:
+            cue_l, cue_r = cue_r, cue_l
+        left = np.convolve(h[:, 2 * src_pair], cue_l)
+        right = np.convolve(h[:, 2 * src_pair + 1], cue_r)
+        # keep the loudness of the base speaker: pink-weighted power over 100 Hz - 16 kHz, both ears
+        n = 1 << int(math.ceil(math.log2(len(left))))
+        f = np.fft.rfftfreq(n, 1.0 / rate)
+        band = (f >= 100) & (f <= 16000)
+
+        def pink_power(*irs):
+            return sum((np.abs(np.fft.rfft(ir, n)[band]) ** 2 / f[band]).sum() for ir in irs)
+
+        scale = math.sqrt(pink_power(h[:, 2 * src_pair], h[:, 2 * src_pair + 1]) / pink_power(left, right))
+        out[:, 2 * dst_pair] = left * scale
+        out[:, 2 * dst_pair + 1] = right * scale
+    write_wav(dst, out, rate)
+
+
+def cmd_render(header, metadata, audio, block=4096):
+    elements = read_header(header)
+    f, fmt = open_caf(audio)
+    rate, _, ch, _, _ = fmt
+    if ch != len(elements):
+        raise SystemExit(f'{audio}: {ch} channels, header lists {len(elements)} elements')
+    by_id = {}
+    order = []
+    for eid, label in elements:
+        e = Element(label)
+        by_id[eid] = e
+        order.append(e)
+    events = iter_events(metadata)
+    pending = next(events, None)
+    out_stream = sys.stdout.buffer
+    t0 = 0
+    while True:
+        x = read_frames(f, fmt, block)
+        if x is None:
+            break
+        n = x.shape[0]
+        t1 = t0 + n
+        while pending is not None and pending[0] is not None and pending[0] < t1:
+            e = by_id.get(pending[1])
+            if e is not None:
+                e.apply(pending[0], pending[2])
+            pending = next(events, None)
+        y = np.zeros((n, NSPK), np.float32)
+        const_idx, const_g = [], []
+        for ci, e in enumerate(order):
+            inner = [p[0] for p in e.pts if t0 < p[0] < t1]
+            if not inner:
+                g0, g1 = e.value_at(t0), e.value_at(t1)
+                if not g0.any() and not g1.any():
+                    continue
+                if np.array_equal(g0, g1):
+                    const_idx.append(ci)
+                    const_g.append(g0)
+                    continue
+                bounds = [t0, t1]
+            else:
+                bounds = [t0] + sorted(set(inner)) + [t1]
+            # piecewise-linear gains for every sample of the block
+            tb = np.array(bounds, np.float64)
+            vb = np.array([e.value_at(b) for b in bounds], np.float32)
+            t = np.arange(t0, t1, dtype=np.float64)
+            k = np.minimum(np.searchsorted(tb, t, side='right') - 1, len(tb) - 2)
+            w = ((t - tb[k]) / (tb[k + 1] - tb[k])).astype(np.float32)[:, None]
+            y += x[:, ci:ci + 1] * (vb[k] + w * (vb[k + 1] - vb[k]))
+            last = e.value_at(t1)
+            e.pts = [p for p in e.pts if p[0] > t1]
+            e.pts.insert(0, (t1, last))
+        if const_idx:
+            y += x[:, const_idx] @ np.array(const_g, np.float32)
+        out_stream.write(y.astype('<f4').tobytes())
+        t0 = t1
+    out_stream.flush()
+
+
+def main(argv):
+    if len(argv) >= 3 and argv[0] == 'make-hrir':
+        cmd_make_hrir(argv[1], argv[2], float(argv[3]) if len(argv) > 3 else 1.0)
+    elif len(argv) == 2 and argv[0] == 'render':
+        base = argv[1]
+        cmd_render(base, base + '.metadata', base + '.audio')
+    elif len(argv) == 2 and argv[0] == 'info':
+        els = read_header(argv[1])
+        beds = [label for _, label in els if label]
+        rate = 48000
+        with open(argv[1] + '.metadata', encoding='utf-8') as f:
+            for line in f:
+                if line.startswith('sampleRate:'):
+                    rate = int(line.split(':', 1)[1])
+                    break
+        print(rate, len(els), len(beds), len(els) - len(beds), ' '.join(beds))
+    else:
+        raise SystemExit('usage: atmos_render.py make-hrir IN16.wav OUT24.wav [strength] | render FILE.atmos | info FILE.atmos')
+
+
+if __name__ == '__main__':
+    main(sys.argv[1:])
+PYEOF
 }
 
 # ---------------------------------------------------------------- test
@@ -462,6 +1045,7 @@ case "$cmd" in
     mpv)    cmd_mpv "$@" ;;
     tracks) cmd_tracks "${1:-}" ;;
     render) cmd_render "$@" ;;
+    atmos)  cmd_atmos "$@" ;;
     help|-h|--help) usage ;;
     *) usage; exit 1 ;;
 esac

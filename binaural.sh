@@ -21,7 +21,7 @@
 #   tracks файл             показать аудиодорожки файла и их номера
 #   render [опции] файл     добавить в MKV бинауральную дорожку (для Infuse и любых плееров)
 #   atmos  [опции] файл     настоящий объектный рендер Dolby Atmos из TrueHD: объекты с их
-#                           координатами раскладываются по виртуальной системе 7.1.4
+#                           координатами раскладываются по виртуальной системе 7.1.6
 #                           и добавляются в MKV бинауральной дорожкой
 #
 # Опции filter / mpv / render / atmos:
@@ -105,8 +105,8 @@ Filter 10: ON PK Fc 4339 Hz Gain 0.9 dB Q 3.49"
 # ---------------------------------------------------------------- helpers
 
 WORK=""
-HRIR714=""
-trap 'rm -rf "${WORK:-}" "${HRIR714:-}"' EXIT
+HRIR716=""
+trap 'rm -rf "${WORK:-}" "${HRIR716:-}"' EXIT
 
 die()  { printf 'Ошибка: %s\n' "$*" >&2; exit 1; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -413,6 +413,10 @@ cmd_render() {
 # ---------------------------------------------------------------- atmos
 
 PYTHON=${PYTHON:-python3}
+# Виртуальная система для объектов: 7.1 на уровне ушей и 6 потолочных колонок
+# (спереди, над головой и сзади) в порядке каналов FFmpeg.
+LAYOUT716="FL+FR+FC+LFE+BL+BR+SL+SR+TFL+TFR+TBL+TBR+TSL+TSR"
+MAP716="FL|FR|FC|LFE|BL|BR|SL|SR|TFL|TFR|TBL|TBR|TSL|TSR"
 TRUEHDD_API="https://api.github.com/repos/truehdd/truehdd/releases/latest"
 
 need_python() {
@@ -533,21 +537,22 @@ cmd_atmos() {
     rate=$1
     echo "Кровать: ${*:5}; объектов: $4; частота: $rate Гц"
 
-    step "2/3 Готовлю отклики 7.1.4 из пресета $OPT_PRESET…"
+    step "2/3 Готовлю отклики 7.1.6 из пресета ${OPT_PRESET}…"
     # Рядом с пресетами: путь к ним уже проверен на символы, ломающие граф фильтров.
-    HRIR714="$HRIR_DIR/.hrir714-$$.wav"
-    "$PYTHON" "$WORK/atmos_render.py" make-hrir "$hrir" "$HRIR714" "$OPT_HEIGHT"
+    HRIR716="$HRIR_DIR/.hrir716-$$.wav"
+    "$PYTHON" "$WORK/atmos_render.py" make-hrir "$hrir" "$HRIR716" "$OPT_HEIGHT"
 
-    # headphone ослабляет на 3 дБ за канал: 12 каналов против 8 в render — компенсируем 12 дБ.
-    gain=$(awk -v g="$OPT_GAIN" 'BEGIN { g += 12; if (g > 40) g = 40; print g }')
-    g="[1:a]aformat=channel_layouts=7.1.4[a];amovie=${HRIR714}[h];[a][h]headphone=map=FL|FR|FC|LFE|BL|BR|SL|SR|TFL|TFR|TBL|TBR:hrir=multich:gain=$gain:lfe=$OPT_LFE${eqc:+,$eqc},alimiter=level=false:limit=0.97[bin]"
+    # headphone ослабляет на 3 дБ за канал: при 14 каналах его усиление 40 дБ (предел)
+    # даёт на каждую колонку столько же, сколько в render при -g 22; остальное — volume.
+    gain=$(awk -v g="$OPT_GAIN" 'BEGIN { print g - 22 }')
+    g="[1:a]aformat=channel_layouts=${LAYOUT716}[a];amovie=${HRIR716}[h];[a][h]headphone=map=$MAP716:hrir=multich:gain=40:lfe=$OPT_LFE,volume=${gain}dB${eqc:+,$eqc},alimiter=level=false:limit=0.97[bin]"
 
     step "3/3 Рендер объектов и запись: $out"
     set -o pipefail
     # shellcheck disable=SC2086
     if ! "$PYTHON" "$WORK/atmos_render.py" render "$master" |
         ffmpeg -hide_banner -loglevel error -stats $ow \
-            -i "$in" -itsoffset "$start" -f f32le -ar "$rate" -ch_layout 7.1.4 -i pipe:0 \
+            -i "$in" -itsoffset "$start" -f f32le -ar "$rate" -ch_layout "$LAYOUT716" -i pipe:0 \
             -filter_complex "$g" \
             -map '0:v?' -map 0:a -map '0:s?' -map '0:t?' -map '[bin]' \
             -c copy $codec \
@@ -571,16 +576,16 @@ write_renderer() {
 Reads a Dolby Atmos master file set (DAMF) written by truehdd: the .atmos header,
 the .atmos.metadata object positions and the .atmos.audio CAF with the bed and
 object signals. Every bed channel and object is panned by its metadata into a
-virtual 7.1.4 speaker array (allocentric, room-centric cube panning, the
-coordinate system Atmos metadata is authored in). The 12 speaker feeds are
-written to stdout as 32-bit float PCM in FFmpeg's 7.1.4 channel order; FFmpeg's
-headphone filter then folds them into binaural stereo.
+virtual 7.1.6 speaker array (allocentric, room-centric cube panning, the
+coordinate system Atmos metadata is authored in). The 14 speaker feeds are
+written to stdout as 32-bit float PCM in FFmpeg's native channel order
+(7.1.4 + TSL TSR); FFmpeg's headphone filter then folds them into binaural stereo.
 
 make-hrir builds the impulse responses for that array from a binaural.sh preset:
-the floor layer is the preset itself, the four height speakers are the front and
-back speakers of the preset filtered with an elevation cue (the spectral change
+the floor layer is the preset itself, the six height speakers are the front, side
+and back speakers of the preset filtered with an elevation cue (the spectral change
 from 0 to 40 degrees elevation on the MIT KEMAR dummy head, smoothed to
-1/2 octave).
+1/2 octave) and with the interaural delay of the raised position.
 """
 
 import math
@@ -589,14 +594,15 @@ import sys
 
 import numpy as np
 
-# FFmpeg 7.1.4 order: FL FR FC LFE BL BR SL SR TFL TFR TBL TBR
-NSPK = 12
+# FFmpeg order: FL FR FC LFE BL BR SL SR TFL TFR TBL TBR TSL TSR
+NSPK = 14
 LFE = 3
 # Speaker rows of the room cube: x (-1 left .. 1 right), y (1 front .. -1 back), z (0 ear level .. 1 ceiling)
 FLOOR_ROWS = [(-1.0, [(-1.0, 4), (1.0, 5)]),
               (0.0, [(-1.0, 6), (1.0, 7)]),
               (1.0, [(-1.0, 0), (0.0, 2), (1.0, 1)])]
 TOP_ROWS = [(-1.0, [(-1.0, 10), (1.0, 11)]),
+            (0.0, [(-1.0, 12), (1.0, 13)]),
             (1.0, [(-1.0, 8), (1.0, 9)])]
 
 # Bed channel labels as truehdd names them, with their positions in the cube.
@@ -609,7 +615,8 @@ BED_POS = {
 }
 
 # Elevation cue, dB at 1/6-octave centres: MIT KEMAR 40 deg over 0 deg elevation
-# (front: 45/40 over 30/0 azimuth/elevation, rear: 135/40 over 135/0), 1/2-octave smoothed.
+# (front: 45/40 over 30/0 azimuth/elevation, side: 90/40 over 90/0, rear: 135/40 over 135/0),
+# 1/2-octave smoothed.
 FREQS = [100, 112, 126, 141, 159, 178, 200, 224, 252, 283, 317, 356, 400, 449, 504, 566, 635, 713, 800, 898, 1008, 1131, 1270, 1425, 1600, 1796, 2016, 2263, 2540, 2851, 3200, 3592, 4032, 4525, 5080, 5702, 6400, 7184, 8063, 9051, 10159, 11404, 12800, 14368, 16127, 18102]
 CUES = {}  # filled from the table below by _load_cues
 
@@ -625,6 +632,8 @@ FRONT_L = [0.0, 0.0, 0.0, 0.0, -0.0, -0.0, 0.0, 0.0, 0.0, -0.0, -0.0, -0.1, -0.3
 FRONT_R = [-0.0, -0.0, 0.0, 0.0, 0.0, -0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -0.1, -0.2, -0.2, -0.8, -1.8, -4.1, -3.9, -1.7, 0.6, 2.2, 1.5, 0.2, -2.4, -2.7, -1.6, 0.3, 1.6, 1.5, 0.8, -0.0, 1.8, 3.4, 5.2, 8.0, 8.0, 8.0, 8.0, 8.0, 2.8, -9.2, -10.0, -8.1, -6.9, -6.9]
 REAR_L = [0.0, 0.0, -0.0, -0.0, -0.0, -0.0, -0.0, 0.0, 0.0, -0.0, -0.0, -0.1, -0.3, -0.3, -0.6, -1.2, -2.3, -2.8, -2.8, -3.2, -3.4, -2.7, -1.5, -0.3, 0.9, 1.5, 1.3, 0.5, -0.3, -0.4, 0.6, 2.6, 5.1, 6.4, 8.0, 8.0, 8.0, 8.0, 5.0, 8.0, 8.0, 8.0, -9.3, 0.3, 0.8, 0.8]
 REAR_R = [0.0, 0.0, 0.0, 0.0, -0.0, -0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.1, 0.2, 0.4, 0.3, -0.1, -1.3, 0.3, 0.6, 3.7, 3.9, 4.3, 2.9, 2.4, 1.8, 1.9, 2.1, 2.9, 3.9, 3.7, 2.8, 2.7, 5.1, 7.0, 8.0, 8.0, 8.0, 8.0, 8.0, 6.7, -4.3, 7.0, 6.6, 6.2, 6.2]
+SIDE_L = [0.0, 0.0, -0.0, -0.0, -0.0, -0.0, -0.0, -0.0, -0.0, -0.0, -0.1, -0.2, -0.4, -0.5, -0.9, -1.5, -2.6, -3.2, -3.1, -3.1, -2.5, -1.5, 0.0, 1.0, 1.7, 1.5, 0.8, 0.4, 1.1, 1.6, 2.7, 3.2, 3.0, 2.0, 1.3, 1.5, 1.4, 1.5, 8.0, 8.0, 8.0, -1.6, -5.2, -1.6, -1.1, -1.1]
+SIDE_R = [0.0, 0.0, 0.0, 0.0, -0.0, -0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, -0.0, -0.1, -0.5, -1.0, -2.4, -2.4, -3.0, -1.9, -2.1, -1.8, -2.3, -2.1, -2.1, -1.7, -1.4, -0.2, -0.1, -0.5, -1.0, 0.4, 2.1, 4.4, 6.1, 7.1, 6.9, 6.6, 5.4, 4.1, 8.0, 8.0, 8.0, 8.0, 8.0]
 """)
 
 
@@ -740,9 +749,7 @@ class Element:
         self.active, self.gain, self.ramp, self.size = True, 0.0, 0, 0.0
         self.snap, self.elev = False, True
         self.pos = BED_POS.get(label, (0.0, 1.0, 0.0)) if label else (0.0, 1.0, 0.0)
-        # piecewise-linear gain trajectory; bed channels play from the start even without
-        # events of their own (truehdd --bed-conform adds 7.1.2 channels that have none)
-        self.pts = [(0, self.target() if label else np.zeros(NSPK))]
+        self.pts = [(0, np.zeros(NSPK))]  # piecewise-linear gain trajectory
 
     def target(self):
         if not self.active or self.gain == -math.inf:
@@ -880,23 +887,42 @@ def min_phase_fir(db_points, rate, taps=512):
     return h * np.hanning(2 * taps)[taps:]
 
 
+# Change of the interaural delay on raising the source (KEMAR, ms, positive = larger):
+# the far ear of a height speaker is shifted by this much against its base speaker.
+ITD_CHANGE_MS = {'FRONT': 0.068, 'REAR': -0.023, 'SIDE': -0.136}
+
+
+def _shift(ir, samples):
+    if samples > 0:
+        return np.concatenate([np.zeros(samples, ir.dtype), ir[:-samples]])
+    if samples < 0:
+        return np.concatenate([ir[-samples:], np.zeros(-samples, ir.dtype)])
+    return ir
+
+
 def cmd_make_hrir(src, dst, strength):
-    """16-channel 7.1 preset -> 24-channel 7.1.4 set (pairs left ear, right ear)."""
+    """16-channel 7.1 preset -> 28-channel 7.1.6 set (pairs left ear, right ear)."""
     h, rate = read_wav(src)
     if h.shape[1] != 16:
         raise SystemExit(src + ': expected 16 channels')
     cue = {k: min_phase_fir([v * strength for v in CUES[k]], rate) for k in CUES}
-    out = np.zeros((h.shape[0] + 511, 24), np.float32)
+    out = np.zeros((h.shape[0] + 511, 2 * NSPK), np.float32)
     out[:h.shape[0], :16] = h
-    # pair index in the 7.1 preset: FL 0, FR 1, BL 4, BR 5; right-side speakers mirror the cue
-    for dst_pair, src_pair, front, mirrored in ((8, 0, True, False), (9, 1, True, True),
-                                                (10, 4, False, False), (11, 5, False, True)):
-        name = 'FRONT' if front else 'REAR'
+    # pair index in the 7.1 preset: FL 0, FR 1, BL 4, BR 5, SL 6, SR 7;
+    # right-side speakers mirror the cue
+    for dst_pair, src_pair, name, mirrored in ((8, 0, 'FRONT', False), (9, 1, 'FRONT', True),
+                                               (10, 4, 'REAR', False), (11, 5, 'REAR', True),
+                                               (12, 6, 'SIDE', False), (13, 7, 'SIDE', True)):
         cue_l, cue_r = cue[name + '_L'], cue[name + '_R']
         if mirrored:
             cue_l, cue_r = cue_r, cue_l
         left = np.convolve(h[:, 2 * src_pair], cue_l)
         right = np.convolve(h[:, 2 * src_pair + 1], cue_r)
+        shift = int(round(ITD_CHANGE_MS[name] * strength * rate / 1000))
+        if mirrored:
+            left = _shift(left, shift)
+        else:
+            right = _shift(right, shift)
         # keep the loudness of the base speaker: pink-weighted power over 100 Hz - 16 kHz, both ears
         n = 1 << int(math.ceil(math.log2(len(left))))
         f = np.fft.rfftfreq(n, 1.0 / rate)

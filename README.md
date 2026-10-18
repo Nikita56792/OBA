@@ -121,7 +121,9 @@ bash binaural.sh atmos -p atmos "Фильм [IMAX] (TrueHD Atmos).mkv"
 4. Результат: `Фильм….atmos-atmos.mkv` с новой дорожкой **«Atmos binaural (atmos)»**.
 
 Работают опции `-p -g -l -e -a -c -o -f` и ещё `-H` — выраженность признака высоты
-(0 — без него, 1 — по умолчанию, 1.5 — сильнее). Нужен Python 3 с numpy: в Anaconda
+(0 — без него, 1 — по умолчанию, 1.5 — сильнее). Если мастер уже сделан вручную
+(`truehdd decode … --output-path master`, с `--bed-conform` или без), его можно передать
+опцией `-m master.atmos`: извлечение пропустится, а сам мастер останется на месте. Нужен Python 3 с numpy: в Anaconda
 он уже есть, иначе скрипт поставит numpy сам.
 
 Что учесть:

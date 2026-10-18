@@ -42,6 +42,8 @@
 # Только для atmos (кроме того, работают -p -g -l -e -a -c -o -f):
 #   -H, --height СИЛА       выраженность признака высоты у потолочных колонок:
 #                           0 — без него, 1 — по умолчанию, 1.5 — сильнее
+#   -m, --master ФАЙЛ.atmos готовый мастер от truehdd decode (с --bed-conform или без):
+#                           извлечение пропускается, файл фильма нужен для видео и дорожек
 # Временные файлы atmos (~1 ГБ на 6 минут фильма) пишутся рядом с результатом;
 # другой каталог можно задать переменной BINAURAL_TMP.
 
@@ -177,7 +179,7 @@ core_graph() {
 # Общие опции -p -g -l -e. Результат в OPT_*; остаток аргументов — в REST (строка через \n).
 parse_common() {
     OPT_PRESET=$DEF_PRESET; OPT_GAIN=$DEF_GAIN; OPT_LFE=$DEF_LFE; OPT_EQ=none
-    OPT_AUDIO=""; OPT_SURROUND=side; OPT_CODEC=flac; OPT_OUT=""; OPT_FORCE=0; OPT_FILE=""; OPT_HEIGHT=1
+    OPT_AUDIO=""; OPT_SURROUND=side; OPT_CODEC=flac; OPT_OUT=""; OPT_FORCE=0; OPT_FILE=""; OPT_HEIGHT=1; OPT_MASTER=""
     while [ $# -gt 0 ]; do
         case "$1" in
             -p|--preset)   OPT_PRESET=${2:?}; shift 2 ;;
@@ -190,6 +192,7 @@ parse_common() {
             -o|--output)   OPT_OUT=${2:?};    shift 2 ;;
             -f|--force)    OPT_FORCE=1;       shift ;;
             -H|--height)   OPT_HEIGHT=${2:?}; shift 2 ;;
+            -m|--master)   OPT_MASTER=${2:?}; shift 2 ;;
             -h|--help)     usage; exit 0 ;;
             -*)            die "неизвестная опция $1" ;;
             *)             [ -z "$OPT_FILE" ] || die "лишний аргумент $1"; OPT_FILE=$1; shift ;;
@@ -454,12 +457,25 @@ for a in json.load(sys.stdin)["assets"]:
     "$TRUEHDD" --version >/dev/null 2>&1 || die "truehdd не запускается: $TRUEHDD"
 }
 
+# Мастер Atmos из дорожки TrueHD: $1 фильм, $2 номер аудиодорожки, $3 путь без расширения.
+extract_master() {
+    step "1/3 Извлекаю объекты Atmos (truehdd)…"
+    set -o pipefail
+    # Матрёшка хранит время с точностью до 1 мс, и у соседних блоков TrueHD оно совпадает;
+    # в сыром потоке время не нужно, поэтому пакеты просто нумеруются.
+    ffmpeg -nostdin -hide_banner -loglevel error -i "$1" -map "0:a:$2" -c copy -bsf:a setts=ts=N -f truehd - |
+        "$TRUEHDD" decode - --output-path "$3" --loglevel error \
+        || die "truehdd не смог декодировать дорожку; версию 7.1 без высот можно взять командой render"
+    set +o pipefail
+    [ -f "$3.atmos" ] || die "в дорожке нет объектов Atmos — для неё подойдёт обычный render"
+}
+
 cmd_atmos() {
     need_ffmpeg
     need_presets
     need_python
     parse_common "$@"
-    local in=$OPT_FILE out nb aidx codec_name lang start dur tmpdir need_kb free_kb g hrir eqc gain rate codec ow=-n
+    local in=$OPT_FILE out nb aidx codec_name lang start dur tmpdir need_kb=0 free_kb g hrir eqc gain rate codec master ow=-n
     [ -n "$in" ] && [ -f "$in" ] || die "укажите файл фильма"
     hrir=$(preset_file "$OPT_PRESET")
     eqc=$(eq_chain "$OPT_EQ")
@@ -487,29 +503,32 @@ cmd_atmos() {
     [ "$OPT_FORCE" = 1 ] && ow=-y
     codec=$(codec_args "$nb")
 
-    # Объекты и кровать декодируются во временный файл: 16 каналов по 24 бита (~1 ГБ на 6 минут).
-    tmpdir=${BINAURAL_TMP:-$(dirname "$out")}
-    need_kb=$(awk -v d="$dur" 'BEGIN { printf "%d", d * 48000 * 16 * 3 / 1024 * 1.05 }')
-    free_kb=$(df -Pk "$tmpdir" | awk 'NR == 2 { print $4 }')
-    if [ "$free_kb" -lt $((need_kb + $(du -k "$in" | awk '{print $1}'))) ]; then
-        die "мало места в $tmpdir: нужно ~$((need_kb / 1048576)) ГБ временно плюс размер фильма для результата (BINAURAL_TMP — другой каталог)"
+    if [ -n "$OPT_MASTER" ]; then
+        master=${OPT_MASTER%.atmos}.atmos
+        for f in "$master" "$master.audio" "$master.metadata"; do
+            [ -f "$f" ] || die "нет файла $f"
+        done
+        tmpdir=${TMPDIR:-/tmp}
+    else
+        # Объекты и кровать декодируются во временный файл: 16 каналов по 24 бита (~1 ГБ на 6 минут).
+        tmpdir=${BINAURAL_TMP:-$(dirname "$out")}
+        need_kb=$(awk -v d="$dur" 'BEGIN { printf "%d", d * 48000 * 16 * 3 / 1024 * 1.05 }')
     fi
-    need_truehdd
+    free_kb=$(df -Pk "$(dirname "$out")" | awk 'NR == 2 { print $4 }')
+    if [ "$free_kb" -lt $((need_kb + $(du -k "$in" | awk '{print $1}'))) ]; then
+        die "мало места: нужно ~$((need_kb / 1048576)) ГБ временно плюс размер фильма для результата (BINAURAL_TMP — другой каталог для временных файлов)"
+    fi
 
     WORK=$(mktemp -d "$tmpdir/.binaural-atmos.XXXXXX")
     write_renderer "$WORK/atmos_render.py"
 
-    step "1/3 Извлекаю объекты Atmos (truehdd)…"
-    set -o pipefail
-    # Матрёшка хранит время с точностью до 1 мс, и у соседних блоков TrueHD оно совпадает;
-    # в сыром потоке время не нужно, поэтому пакеты просто нумеруются.
-    ffmpeg -nostdin -hide_banner -loglevel error -i "$in" -map "0:a:$aidx" -c copy -bsf:a setts=ts=N -f truehd - |
-        "$TRUEHDD" decode - --output-path "$WORK/master" --loglevel error \
-        || die "truehdd не смог декодировать дорожку; версию 7.1 без высот можно взять командой render"
-    set +o pipefail
-    [ -f "$WORK/master.atmos" ] || die "в дорожке нет объектов Atmos — для неё подойдёт обычный render"
+    if [ -z "$OPT_MASTER" ]; then
+        need_truehdd
+        master="$WORK/master.atmos"
+        extract_master "$in" "$aidx" "$WORK/master"
+    fi
     # shellcheck disable=SC2046
-    set -- $("$PYTHON" "$WORK/atmos_render.py" info "$WORK/master.atmos")
+    set -- $("$PYTHON" "$WORK/atmos_render.py" info "$master")
     [ $# -ge 4 ] || die "не удалось прочитать мастер Atmos"
     rate=$1
     echo "Кровать: ${*:5}; объектов: $4; частота: $rate Гц"
@@ -526,7 +545,7 @@ cmd_atmos() {
     step "3/3 Рендер объектов и запись: $out"
     set -o pipefail
     # shellcheck disable=SC2086
-    if ! "$PYTHON" "$WORK/atmos_render.py" render "$WORK/master.atmos" |
+    if ! "$PYTHON" "$WORK/atmos_render.py" render "$master" |
         ffmpeg -hide_banner -loglevel error -stats $ow \
             -i "$in" -itsoffset "$start" -f f32le -ar "$rate" -ch_layout 7.1.4 -i pipe:0 \
             -filter_complex "$g" \
@@ -721,7 +740,9 @@ class Element:
         self.active, self.gain, self.ramp, self.size = True, 0.0, 0, 0.0
         self.snap, self.elev = False, True
         self.pos = BED_POS.get(label, (0.0, 1.0, 0.0)) if label else (0.0, 1.0, 0.0)
-        self.pts = [(0, np.zeros(NSPK))]  # piecewise-linear gain trajectory
+        # piecewise-linear gain trajectory; bed channels play from the start even without
+        # events of their own (truehdd --bed-conform adds 7.1.2 channels that have none)
+        self.pts = [(0, self.target() if label else np.zeros(NSPK))]
 
     def target(self):
         if not self.active or self.gain == -math.inf:

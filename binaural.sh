@@ -504,7 +504,7 @@ cmd_atmos() {
     # Матрёшка хранит время с точностью до 1 мс, и у соседних блоков TrueHD оно совпадает;
     # в сыром потоке время не нужно, поэтому пакеты просто нумеруются.
     ffmpeg -nostdin -hide_banner -loglevel error -i "$in" -map "0:a:$aidx" -c copy -bsf:a setts=ts=N -f truehd - |
-        "$TRUEHDD" decode - --output-path "$WORK/master" --loglevel warn \
+        "$TRUEHDD" decode - --output-path "$WORK/master" --loglevel error \
         || die "truehdd не смог декодировать дорожку; версию 7.1 без высот можно взять командой render"
     set +o pipefail
     [ -f "$WORK/master.atmos" ] || die "в дорожке нет объектов Atmos — для неё подойдёт обычный render"

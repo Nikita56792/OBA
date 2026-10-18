@@ -329,6 +329,38 @@ cmd_mpv() {
 
 # ---------------------------------------------------------------- tracks / render
 
+# Обложки фильма (картинки-вложения) при перепаковке ffmpeg превратил бы в видеодорожку
+# из одного кадра. Вместо этого они сохраняются в $2 и возвращаются вложениями:
+# аргументы для ffmpeg складываются в массив COVER_ARGS.
+COVER_ARGS=()
+cover_attachments() {
+    local k idx codec fname mime ext list
+    COVER_ARGS=()
+    k=$(ffprobe -v error -select_streams t -show_entries stream=index -of csv=p=0 "$1" | wc -l | tr -d ' ')
+    list=$(ffprobe -v error -select_streams v \
+        -show_entries stream=index,codec_name:stream_disposition=attached_pic:stream_tags=filename,mimetype \
+        -of flat "$1" | awk -F= '
+        { split($1, key, "."); n = key[3]; v = $2; gsub(/^"|"$/, "", v) }
+        $1 ~ /\.index$/                    { idx[n] = v }
+        $1 ~ /\.codec_name$/               { codec[n] = v }
+        $1 ~ /\.disposition\.attached_pic$/ { pic[n] = v }
+        $1 ~ /\.tags\.filename$/           { name[n] = v }
+        $1 ~ /\.tags\.mimetype$/           { mime[n] = v }
+        END { for (n in idx) if (pic[n] == 1) print idx[n] "|" codec[n] "|" name[n] "|" mime[n] }')
+    while IFS='|' read -r idx codec fname mime; do
+        [ -n "$idx" ] || continue
+        ext=jpg
+        [ "$codec" = png ] && ext=png
+        ffmpeg -nostdin -hide_banner -loglevel error -y -i "$1" -map "0:$idx" -c copy -frames:v 1 \
+            -f image2 "$2/cover$idx.$ext" || continue
+        COVER_ARGS+=(-attach "$2/cover$idx.$ext"
+            "-metadata:s:t:$k" "mimetype=${mime:-image/$ext}" "-metadata:s:t:$k" "filename=${fname:-cover.$ext}")
+        k=$((k + 1))
+    done <<EOF_COVERS
+$list
+EOF_COVERS
+}
+
 # Аргументы кодека для новой аудиодорожки с номером $1 (по счёту среди аудиодорожек результата).
 codec_args() {
     case "$OPT_CODEC" in
@@ -397,10 +429,13 @@ cmd_render() {
     g=$(core_graph "$OPT_PRESET" "$OPT_GAIN" "$OPT_LFE" "$OPT_EQ" "$pan")
     g="[0:a:$aidx]${g}[bin]"
     step "Рендер: пресет $OPT_PRESET → $out"
+    WORK=$(mktemp -d "${TMPDIR:-/tmp}/binaural.XXXXXX")
+    cover_attachments "$in" "$WORK"
     # shellcheck disable=SC2086
     ffmpeg -nostdin -hide_banner -loglevel error -stats $ow \
         -i "$in" -filter_complex "$g" \
-        -map '0:v?' -map 0:a -map '0:s?' -map '0:t?' -map '[bin]' \
+        -map '0:V?' -map 0:a -map '0:s?' -map '0:t?' -map '[bin]' \
+        ${COVER_ARGS[@]+"${COVER_ARGS[@]}"} \
         -c copy $codec $sub_args \
         -metadata:s:a:$nb title="Binaural ($OPT_PRESET)" \
         -metadata:s:a:$nb language="${lang:-und}" \
@@ -463,7 +498,7 @@ for a in json.load(sys.stdin)["assets"]:
 
 # Мастер Atmos из дорожки TrueHD: $1 фильм, $2 номер аудиодорожки, $3 путь без расширения.
 extract_master() {
-    step "1/3 Извлекаю объекты Atmos (truehdd)…"
+    step "1/4 Извлекаю объекты Atmos (truehdd)…"
     set -o pipefail
     # Матрёшка хранит время с точностью до 1 мс, и у соседних блоков TrueHD оно совпадает;
     # в сыром потоке время не нужно, поэтому пакеты просто нумеруются.
@@ -479,7 +514,7 @@ cmd_atmos() {
     need_presets
     need_python
     parse_common "$@"
-    local in=$OPT_FILE out nb aidx codec_name lang start dur tmpdir need_kb=0 free_kb g hrir eqc gain rate codec master ow=-n
+    local in=$OPT_FILE out nb aidx codec_name lang start dur tmpdir need_kb=0 free_kb g hrir eqc gain rate codec master sub_args="" ow=-n
     [ -n "$in" ] && [ -f "$in" ] || die "укажите файл фильма"
     hrir=$(preset_file "$OPT_PRESET")
     eqc=$(eq_chain "$OPT_EQ")
@@ -505,7 +540,8 @@ cmd_atmos() {
     [ "$out" != "$in" ] || die "выходной файл совпадает со входным"
     [ ! -e "$out" ] || [ "$OPT_FORCE" = 1 ] || die "$out уже существует (добавьте -f)"
     [ "$OPT_FORCE" = 1 ] && ow=-y
-    codec=$(codec_args "$nb")
+    codec=$(codec_args 0)
+    case "$in" in *.[mM][pP]4|*.[mM]4[vV]|*.[mM][oO][vV]) sub_args="-c:s srt" ;; esac   # mov_text в MKV не кладётся
 
     if [ -n "$OPT_MASTER" ]; then
         master=${OPT_MASTER%.atmos}.atmos
@@ -537,7 +573,7 @@ cmd_atmos() {
     rate=$1
     echo "Кровать: ${*:5}; объектов: $4; частота: $rate Гц"
 
-    step "2/3 Готовлю отклики 7.1.6 из пресета ${OPT_PRESET}…"
+    step "2/4 Готовлю отклики 7.1.6 из пресета ${OPT_PRESET}…"
     # Рядом с пресетами: путь к ним уже проверен на символы, ломающие граф фильтров.
     HRIR716="$HRIR_DIR/.hrir716-$$.wav"
     "$PYTHON" "$WORK/atmos_render.py" make-hrir "$hrir" "$HRIR716" "$OPT_HEIGHT"
@@ -545,26 +581,44 @@ cmd_atmos() {
     # headphone ослабляет на 3 дБ за канал: при 14 каналах его усиление 40 дБ (предел)
     # даёт на каждую колонку столько же, сколько в render при -g 22; остальное — volume.
     gain=$(awk -v g="$OPT_GAIN" 'BEGIN { print g - 22 }')
-    g="[1:a]aformat=channel_layouts=${LAYOUT716}[a];amovie=${HRIR716}[h];[a][h]headphone=map=$MAP716:hrir=multich:gain=40:lfe=$OPT_LFE,volume=${gain}dB${eqc:+,$eqc},alimiter=level=false:limit=0.97[bin]"
+    g="[0:a]aformat=channel_layouts=${LAYOUT716}[a];amovie=${HRIR716}[h];[a][h]headphone=map=$MAP716:hrir=multich:gain=40:lfe=$OPT_LFE,volume=${gain}dB${eqc:+,$eqc},alimiter=level=false:limit=0.97[bin]"
 
-    step "3/3 Рендер объектов и запись: $out"
+    step "3/4 Рендер объектов…"
     set -o pipefail
     # shellcheck disable=SC2086
-    if ! "$PYTHON" "$WORK/atmos_render.py" render "$master" |
-        ffmpeg -hide_banner -loglevel error -stats $ow \
-            -i "$in" -itsoffset "$start" -f f32le -ar "$rate" -ch_layout "$LAYOUT716" -i pipe:0 \
-            -filter_complex "$g" \
-            -map '0:v?' -map 0:a -map '0:s?' -map '0:t?' -map '[bin]' \
-            -c copy $codec \
+    "$PYTHON" "$WORK/atmos_render.py" render "$master" |
+        ffmpeg -hide_banner -loglevel error -stats -y \
+            -f f32le -ar "$rate" -ch_layout "$LAYOUT716" -i pipe:0 \
+            -filter_complex "$g" -map '[bin]' $codec "$WORK/binaural.mka" \
+        || die "рендер прерван"
+    set +o pipefail
+
+    # Вклеивание дорожки. Когда входов несколько, ffmpeg читает тот, где «отстаёт» самый
+    # редкий поток (обложка из одного кадра, субтитры), и, не найдя его следующий пакет,
+    # проходит весь фильм раньше новой дорожки: звук оказывается в конце файла, где плееры
+    # его не находят. Поэтому обложки идут вложениями, а субтитры — отдельным маленьким файлом.
+    step "4/4 Запись: $out"
+    cover_attachments "$in" "$WORK"
+    local subs_in="" subs_map=""
+    if [ -n "$(ffprobe -v error -select_streams s -show_entries stream=index -of csv=p=0 "$in")" ]; then
+        # shellcheck disable=SC2086
+        ffmpeg -nostdin -hide_banner -loglevel error -y -i "$in" -map 0:s -c copy $sub_args "$WORK/subs.mkv"
+        subs_in="$WORK/subs.mkv"
+        subs_map="-map 2:s"
+    fi
+    # shellcheck disable=SC2086
+    if ! ffmpeg -hide_banner -loglevel error -stats $ow \
+            -i "$in" -itsoffset "$start" -i "$WORK/binaural.mka" ${subs_in:+-i "$subs_in"} \
+            -map '0:V?' -map 0:a -map 1:a $subs_map -map '0:t?' \
+            ${COVER_ARGS[@]+"${COVER_ARGS[@]}"} \
+            -c copy \
             -metadata:s:a:$nb title="Atmos binaural ($OPT_PRESET)" \
             -metadata:s:a:$nb language="${lang:-und}" \
             -disposition:a 0 -disposition:a:$nb default \
-            -max_muxing_queue_size 9999 \
             "$out"; then
         rm -f "$out"
-        die "рендер прерван, неполный файл удалён"
+        die "запись прервана, неполный файл удалён"
     fi
-    set +o pipefail
     echo "Готово. В плеере выберите аудиодорожку «Atmos binaural ($OPT_PRESET)»."
 }
 
